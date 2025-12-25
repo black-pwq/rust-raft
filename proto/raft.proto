@@ -10,6 +10,8 @@ service Raft {
 	rpc RequestVote (RequestVoteArgs) returns (RequestVoteReply);
 	// Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
 	rpc AppendEntries (AppendEntriesArgs) returns (AppendEntriesReply);
+	// Invoked by clients to submit commands to the cluster.
+	rpc ClientCommand (ClientRequest) returns (ClientReply);
 }
 
 message AppendEntriesArgs {
@@ -34,8 +36,25 @@ message AppendEntriesReply {
 message LogEntry {
 	// Term when entry was received by leader.
 	uint32 term = 1;
-	// State machine command.
-	string command = 2;
+	// State machine command (KV-specific, structured).
+	KvCommand command = 2;
+}
+
+// KV commands encoded into the Raft log.
+message KvGet {
+	string key = 1;
+}
+
+message KvSet {
+	string key = 1;
+	string value = 2;
+}
+
+message KvCommand {
+	oneof cmd {
+		KvGet get = 1;
+		KvSet set = 2;
+	}
 }
 
 message RequestVoteArgs {
@@ -54,3 +73,30 @@ message RequestVoteReply {
 	bool vote_granted = 2;
 }	
 
+// KV command types
+enum CommandType {
+	GET = 0;
+	SET = 1;
+}
+
+// Client request to submit a KV command to the Raft cluster.
+message ClientRequest {
+	// The type of command (GET or SET).
+	CommandType command_type = 1;
+	// The key to operate on.
+	string key = 2;
+	// The value to set (only for SET commands).
+	string value = 3;
+}
+
+// Client reply after command has been applied or an error occurred.
+message ClientReply {
+	// True if the command was successfully applied.
+	bool success = 1;
+	// Error message if success is false.
+	string error = 2;
+	// The leader ID if this node is not the leader (for client redirection).
+	uint32 leader_id = 3;
+	// The value retrieved (only for successful GET commands).
+	string value = 4;
+}

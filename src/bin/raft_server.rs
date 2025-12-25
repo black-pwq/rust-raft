@@ -27,7 +27,7 @@ async fn start_one(config: Arc<RaftConfig>) -> Result<(), Box<dyn std::error::Er
     tokio::spawn(async move {
         while let Some(entry) = apply_rx.recv().await {
             info!(
-                "[Node {}] [StateMachine] Applying log entry: term={}, command='{}'",
+                "[Node {}] [StateMachine] Applying log entry: term={}, command={:?}",
                 node_id, entry.term, entry.command
             );
             // TODO: Apply to actual state machine

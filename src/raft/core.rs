@@ -1,18 +1,57 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{Duration, Instant},
 };
 use tracing::{error, info};
 
 use crate::raft::{
     client::Peer,
-    proto::{AppendEntriesArgs, AppendEntriesReply, LogEntry, RequestVoteArgs, RequestVoteReply},
+    proto::{
+        kv_command, AppendEntriesArgs, AppendEntriesReply, KvCommand, KvGet, KvSet, LogEntry,
+        RequestVoteArgs, RequestVoteReply,
+    },
 };
+
+/// KV存储命令
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Get { key: String },
+    Set { key: String, value: String },
+}
+
+impl From<Command> for KvCommand {
+    fn from(value: Command) -> Self {
+        match value {
+            Command::Get { key } => KvCommand {
+                cmd: Some(kv_command::Cmd::Get(KvGet { key })),
+            },
+            Command::Set { key, value } => KvCommand {
+                cmd: Some(kv_command::Cmd::Set(KvSet { key, value })),
+            },
+        }
+    }
+}
+
+impl TryFrom<KvCommand> for Command {
+    type Error = ();
+
+    fn try_from(value: KvCommand) -> Result<Self, Self::Error> {
+        match value.cmd {
+            Some(kv_command::Cmd::Get(get)) => Ok(Command::Get { key: get.key }),
+            Some(kv_command::Cmd::Set(set)) => Ok(Command::Set {
+                key: set.key,
+                value: set.value,
+            }),
+            None => Err(()),
+        }
+    }
+}
 
 /// Raft service implementation
 #[derive(Clone)]
@@ -21,7 +60,8 @@ pub struct RaftService {
     apply_tx: mpsc::UnboundedSender<LogEntry>,
     peers: Arc<Vec<Arc<Peer>>>,
     config: Arc<RaftConfig>,
-    last_heartbeat: Arc<Mutex<Instant>>,
+    /// 跟踪等待应用的客户端请求：日志索引 -> 通知通道
+    pending_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>,
 }
 
 /// Core Raft state based on Figure 2
@@ -46,6 +86,10 @@ pub struct RaftCore {
     pub state: NodeState,
     /// This server's ID
     pub id: u32,
+    /// 最近已知的leader ID（用于客户端重定向）
+    pub last_known_leader: Option<u32>,
+    /// 最后一次收到心跳的时间
+    pub last_heartbeat: Instant,
 }
 
 /// Raft node states from Figure 2
@@ -87,12 +131,14 @@ impl RaftCore {
             voted_for: None,
             log: vec![LogEntry {
                 term: 0,
-                command: "".to_string(),
+                command: None,
             }],
             commit_index: 0,
             last_applied: 0,
             state: NodeState::Follower,
             id,
+            last_known_leader: None,
+            last_heartbeat: Instant::now(),
         }
     }
 
@@ -157,13 +203,28 @@ impl RaftCore {
         }
     }
 
+    /// 通知等待指定索引的客户端请求
+    fn notify_pending_request(
+        index: u32,
+        pending_requests: &Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>,
+    ) {
+        let mut pending = pending_requests.lock().unwrap();
+        if let Some(tx) = pending.remove(&index) {
+            let _ = tx.send(Ok(()));
+        }
+    }
+
     /// 将已提交但未应用的日志条目应用到状态机
     ///
     /// # Notes
     /// 两个地方会调用它：
     /// - 收到 AppendEntriesReply （由 Leader 发出 AE RPC 后收到回复时）
     /// - 收到 AppendEntries （由 Follower 收到 AE RPC 时进行处理）
-    fn apply_logs(&mut self, sender: &mpsc::UnboundedSender<LogEntry>) {
+    fn apply_logs(
+        &mut self,
+        sender: &mpsc::UnboundedSender<LogEntry>,
+        pending_requests: &Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>,
+    ) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let entry = self.log[self.last_applied as usize].clone();
@@ -178,6 +239,9 @@ impl RaftCore {
                     self.id, err
                 );
             }
+            
+            // 通知等待此日志索引的客户端请求
+            Self::notify_pending_request(self.last_applied, pending_requests);
         }
     }
 }
@@ -194,7 +258,7 @@ impl RaftService {
             apply_tx,
             peers: peers.clone(),
             config: config.clone(),
-            last_heartbeat: Arc::new(Mutex::new(Instant::now())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Spawn election timer task
@@ -207,8 +271,10 @@ impl RaftService {
                 let timeout = Duration::from_millis(timeout);
 
                 // Check if election timeout has passed without receiving heartbeat
-                let is_leader = matches!(svc.core.lock().unwrap().state, NodeState::Leader { .. });
-                let elapsed = svc.get_last_heartbeat().elapsed();
+                let (is_leader, elapsed) = {
+                    let core = svc.core.lock().unwrap();
+                    (matches!(core.state, NodeState::Leader { .. }), core.last_heartbeat.elapsed())
+                };
 
                 info!(
                     "[Node {}] Election timer: is_leader={}, elapsed={:?}, timeout={:?}",
@@ -221,7 +287,8 @@ impl RaftService {
                         svc.config.node_id, elapsed
                     );
                     svc.start_election().await;
-                    svc.on_receive_heartbeat(); // reset heartbeat timer
+                    // Reset heartbeat timer
+                    svc.core.lock().unwrap().last_heartbeat = Instant::now();
                 } else if elapsed < timeout {
                     tokio::time::sleep(timeout - elapsed).await;
                 } else {
@@ -354,7 +421,7 @@ impl RaftService {
                         node.id, node.commit_index
                     );
                 }
-                node.apply_logs(&self.apply_tx);
+                node.apply_logs(&self.apply_tx, &self.pending_requests);
             } else if args.term >= reply.term {
                 // 如果AE被拒绝了，有可能
                 // 1. 它的任期比那时我的任期更大
@@ -446,8 +513,11 @@ impl RaftService {
     }
 
     pub fn handle_append_entries(&self, mut args: AppendEntriesArgs) -> AppendEntriesReply {
-        self.on_receive_heartbeat();
         let mut node = self.core.lock().unwrap();
+        
+        // 更新心跳时间
+        node.last_heartbeat = Instant::now();
+        
         node.on_receive_term(args.term);
 
         info!(
@@ -466,6 +536,9 @@ impl RaftService {
             );
             return AppendEntriesReply { term, success };
         }
+
+        // 更新已知的leader（仅在term检查通过后）
+        node.last_known_leader = Some(args.leader_id);
 
         // Reply false if log doesn't contain an entry at prev_log_index
         // whose term matches prev_log_term (§5.3)
@@ -518,19 +591,121 @@ impl RaftService {
                 "[Node {}] Updated commit_index to {}",
                 node.id, node.commit_index
             );
-            node.apply_logs(&self.apply_tx);
+            node.apply_logs(&self.apply_tx, &self.pending_requests);
         }
 
         AppendEntriesReply { term, success }
     }
 
-    fn on_receive_heartbeat(&self) {
-        let mut last_heartbeat = self.last_heartbeat.lock().unwrap();
-        *last_heartbeat = Instant::now();
+    /// 注册等待应用的客户端请求
+    fn register_pending_request(
+        &self,
+        log_index: u32,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        let mut pending = self.pending_requests.lock().unwrap();
+        pending.insert(log_index, tx);
+        rx
     }
 
-    fn get_last_heartbeat(&self) -> Instant {
-        let last_heartbeat = self.last_heartbeat.lock().unwrap();
-        *last_heartbeat
+    /// 提议一个新的命令到Raft集群
+    /// 
+    /// # Arguments
+    /// * `command` - 要提议的命令
+    /// 
+    /// # Returns
+    /// * `Ok(log_index)` - 如果是leader，返回该命令在日志中的索引
+    /// * `Err(leader_id)` - 如果不是leader，返回可能的leader ID（可能为None）
+    pub fn propose_command(&self, command: Command) -> Result<u32, Option<u32>> {
+        let mut node = self.core.lock().unwrap();
+        
+        // 检查是否是leader
+        if !matches!(node.state, NodeState::Leader { .. }) {
+            // 不是leader，返回最近已知的leader
+            return Err(node.last_known_leader);
+        }
+        
+        // 创建新的日志条目
+        let entry = LogEntry {
+            term: node.current_term,
+            command: Some(command.into()),
+        };
+        
+        // 将条目追加到日志中
+        node.log.push(entry);
+        let log_index = node.last_log_index();
+        
+        info!(
+            "[Node {}] Proposed command at index {} for term {}",
+            node.id, log_index, node.current_term
+        );
+        
+        Ok(log_index)
+    }
+
+    /// 处理客户端请求
+    /// 
+    /// # Arguments
+    /// * `command` - 客户端提交的命令
+    /// * `timeout` - 等待应用的超时时间
+    /// 
+    /// # Returns
+    /// * `Ok(())` - 命令成功被应用
+    /// * `Err(error_message)` - 发生错误（超时、不是leader等）
+    pub async fn handle_client_request(
+        &self,
+        command: Command,
+        timeout: Duration,
+    ) -> Result<(), (String, Option<u32>)> {
+        // 提议命令
+        let log_index = match self.propose_command(command) {
+            Ok(index) => index,
+            Err(leader_id) => {
+                return Err((
+                    "Not the leader".to_string(),
+                    leader_id,
+                ));
+            }
+        };
+        
+        // 注册等待应用的请求
+        let rx = self.register_pending_request(log_index);
+        
+        // 立即广播以加快复制
+        self.broadcast_heartbeat().await;
+        
+        // 等待应用或超时
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(()))) => {
+                info!(
+                    "[Node {}] Client request at index {} applied successfully",
+                    self.config.node_id, log_index
+                );
+                Ok(())
+            }
+            Ok(Ok(Err(err))) => {
+                error!(
+                    "[Node {}] Client request at index {} failed: {}",
+                    self.config.node_id, log_index, err
+                );
+                Err((err, None))
+            }
+            Ok(Err(_)) => {
+                // 通道被关闭（sender被drop）
+                Err(("Internal error: notification channel closed".to_string(), None))
+            }
+            Err(_) => {
+                // 超时
+                // 清理pending请求
+                let mut pending = self.pending_requests.lock().unwrap();
+                pending.remove(&log_index);
+                
+                error!(
+                    "[Node {}] Client request at index {} timed out after {:?}",
+                    self.config.node_id, log_index, timeout
+                );
+                Err(("Request timeout".to_string(), None))
+            }
+        }
     }
 }

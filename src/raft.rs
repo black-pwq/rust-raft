@@ -8,12 +8,13 @@ pub mod proto {
 }
 
 use proto::{
-    AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply, raft_server::Raft,
+    AppendEntriesArgs, AppendEntriesReply, ClientReply, ClientRequest, CommandType,
+    RequestVoteArgs, RequestVoteReply, raft_server::Raft,
 };
 
 // Re-export key types for consumers of the crate.
 pub use client::Peer;
-pub use core::RaftService;
+pub use core::{Command, RaftService};
 
 #[tonic::async_trait]
 impl Raft for RaftService {
@@ -37,5 +38,44 @@ impl Raft for RaftService {
         let args = request.into_inner();
         let reply = self.handle_append_entries(args);
         Ok(Response::new(reply))
+    }
+
+    /// ClientCommand RPC implementation
+    /// Invoked by clients to submit commands to the cluster
+    async fn client_command(
+        &self,
+        request: Request<ClientRequest>,
+    ) -> Result<Response<ClientReply>, Status> {
+        let req = request.into_inner();
+        let timeout = tokio::time::Duration::from_secs(5); // 5秒超时
+        
+        // 构造命令
+        let command = match CommandType::try_from(req.command_type) {
+            Ok(CommandType::Get) => Command::Get { key: req.key },
+            Ok(CommandType::Set) => Command::Set { key: req.key, value: req.value },
+            Err(_) => {
+                return Ok(Response::new(ClientReply {
+                    success: false,
+                    error: "Invalid command type".to_string(),
+                    leader_id: 0,
+                    value: String::new(),
+                }));
+            }
+        };
+        
+        match self.handle_client_request(command, timeout).await {
+            Ok(()) => Ok(Response::new(ClientReply {
+                success: true,
+                error: String::new(),
+                leader_id: 0,
+                value: String::new(), // TODO: 从状态机获取实际值
+            })),
+            Err((error, leader_id)) => Ok(Response::new(ClientReply {
+                success: false,
+                error,
+                leader_id: leader_id.unwrap_or(0),
+                value: String::new(),
+            })),
+        }
     }
 }
