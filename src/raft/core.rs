@@ -4,15 +4,13 @@ use std::{
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{Notify, mpsc},
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::raft::{
-    client::Peer,
-    proto::{kv_command, KvCommand, KvGet, KvSet},
-};
+use crate::raft::client::Peer;
 
 /// KV存储命令
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,34 +73,6 @@ pub enum ApplyMsg {
     Snapshot {},
 }
 
-impl From<Command> for KvCommand {
-    fn from(value: Command) -> Self {
-        match value {
-            Command::Get { key } => KvCommand {
-                cmd: Some(kv_command::Cmd::Get(KvGet { key })),
-            },
-            Command::Set { key, value } => KvCommand {
-                cmd: Some(kv_command::Cmd::Set(KvSet { key, value })),
-            },
-        }
-    }
-}
-
-impl TryFrom<KvCommand> for Command {
-    type Error = ();
-
-    fn try_from(value: KvCommand) -> Result<Self, Self::Error> {
-        match value.cmd {
-            Some(kv_command::Cmd::Get(get)) => Ok(Command::Get { key: get.key }),
-            Some(kv_command::Cmd::Set(set)) => Ok(Command::Set {
-                key: set.key,
-                value: set.value,
-            }),
-            None => Err(()),
-        }
-    }
-}
-
 /// Raft service implementation
 #[derive(Clone)]
 pub struct RaftService {
@@ -110,6 +80,10 @@ pub struct RaftService {
     apply_tx: mpsc::UnboundedSender<ApplyMsg>,
     peers: Arc<Vec<Arc<Peer>>>,
     config: Arc<RaftConfig>,
+    /// 每个peer对应的通知器
+    replicator_notifiers: Arc<Vec<Arc<Notify>>>,
+    /// 全局取消令牌：用于关闭所有replicator
+    shutdown_token: CancellationToken,
 }
 
 /// Core Raft state based on Figure 2
@@ -240,6 +214,7 @@ impl RaftCore {
     }
 
     fn on_receive_term(&mut self, term: u32) {
+        self.last_heartbeat = Instant::now();
         if term > self.current_term {
             info!(
                 "[Node {}] Discovered higher term {} from peer ?, reverting to follower",
@@ -257,10 +232,7 @@ impl RaftCore {
     /// 两个地方会调用它：
     /// - 收到 AppendEntriesReply （由 Leader 发出 AE RPC 后收到回复时）
     /// - 收到 AppendEntries （由 Follower 收到 AE RPC 时进行处理）
-    fn apply_logs(
-        &mut self,
-        sender: &mpsc::UnboundedSender<ApplyMsg>,
-    ) {
+    fn apply_logs(&mut self, sender: &mpsc::UnboundedSender<ApplyMsg>) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let entry = self.log[self.last_applied as usize].clone();
@@ -292,46 +264,115 @@ impl RaftService {
         apply_tx: mpsc::UnboundedSender<ApplyMsg>,
         config: &Arc<RaftConfig>,
     ) -> Self {
+        let shutdown_token = CancellationToken::new();
+
+        // 为每个peer创建通知器
+        let replicator_notifiers: Arc<Vec<Arc<Notify>>> =
+            Arc::new(peers.iter().map(|_| Arc::new(Notify::new())).collect());
+
         // Initialize RaftCore
         let service = Self {
             core: Arc::new(Mutex::new(RaftCore::new(config.node_id))),
             apply_tx,
             peers: peers.clone(),
             config: config.clone(),
+            replicator_notifiers: replicator_notifiers.clone(),
+            shutdown_token: shutdown_token.clone(),
         };
+
+        // 为每个peer启动一个长期运行的Replicator任务
+        for (i, peer) in peers.iter().enumerate() {
+            if peer.id == config.node_id {
+                // 跳过自己
+                continue;
+            }
+
+
+            let svc = service.clone();
+            let peer_clone = peer.clone();
+            let notify = replicator_notifiers[i].clone();
+            let cancel = shutdown_token.clone();
+
+            // Replicator 任务，发送 AppendEntries RPC
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        // 收到取消信号，退出循环
+                        _ = cancel.cancelled() => {
+                            info!(
+                                "[Node {}] Replicator for peer {} cancelled",
+                                svc.config.node_id,
+                                peer_clone.id,
+                            );
+                            break;
+                        }
+                        // 收到通知信号或超时
+                        _ = tokio::time::timeout(
+                            Duration::from_millis(svc.config.heartbeat_interval_ms),
+                            notify.notified()
+                        ) => {
+                            // Replicator只负责日志复制（发送AppendEntries）
+                            // 防御性检查在send_append_entries内部进行
+                            svc.send_append_entries(&peer_clone).await;
+                        }
+                    }
+                }
+            });
+        }
 
         // Spawn election timer task
         let svc = service.clone();
+        let election_cancel = shutdown_token.clone();
         tokio::spawn(async move {
             loop {
-                let timeout = svc.config.election_timeout_ms.0
-                    + (rand::random::<u64>()
-                        % (svc.config.election_timeout_ms.1 - svc.config.election_timeout_ms.0));
-                let timeout = Duration::from_millis(timeout);
+                tokio::select! {
+                    _ = election_cancel.cancelled() => {
+                        info!("[Node {}] Election timer cancelled", svc.config.node_id);
+                        break;
+                    }
+                    _ = async {
+                        let timeout = svc.config.election_timeout_ms.0
+                            + (rand::random::<u64>()
+                                % (svc.config.election_timeout_ms.1 - svc.config.election_timeout_ms.0));
+                        let timeout = Duration::from_millis(timeout);
 
-                // Check if election timeout has passed without receiving heartbeat
-                let (is_leader, elapsed) = {
-                    let core = svc.core.lock().unwrap();
-                    (matches!(core.state, NodeState::Leader { .. }), core.last_heartbeat.elapsed())
-                };
+                        // Check if election timeout has passed without receiving heartbeat
+                        let (is_leader, elapsed) = {
+                            let core = svc.core.lock().unwrap();
+                            (
+                                matches!(core.state, NodeState::Leader { .. }),
+                                core.last_heartbeat.elapsed(),
+                            )
+                        };
 
-                if !is_leader && elapsed >= timeout {
-                    info!(
-                        "[Node {}] Election timeout triggered after {:?}",
-                        svc.config.node_id, elapsed
-                    );
-                    svc.start_election().await;
-                    // Reset heartbeat timer
-                    svc.core.lock().unwrap().last_heartbeat = Instant::now();
-                } else if elapsed < timeout {
-                    tokio::time::sleep(timeout - elapsed).await;
-                } else {
-                    tokio::time::sleep(Duration::from_millis(svc.config.heartbeat_interval_ms)).await;
+                        if !is_leader && elapsed >= timeout {
+                            info!(
+                                "[Node {}] Election timeout triggered after {:?}",
+                                svc.config.node_id, elapsed
+                            );
+                            svc.start_election().await;
+                        } else if elapsed < timeout {
+                            tokio::time::sleep(timeout - elapsed).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(svc.config.heartbeat_interval_ms))
+                                .await;
+                        }
+                    } => {}
                 }
             }
         });
 
         service
+    }
+    /// 优雅地关闭所有Replicator任务
+    pub async fn shutdown(&self) {
+        info!(
+            "[Node {}] Shutting down all replicators",
+            self.config.node_id
+        );
+        self.shutdown_token.cancel();
+        // 给一些时间让任务优雅退出
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     /// 返回当前节点的 (任期, 是否为Leader)
@@ -343,85 +384,44 @@ impl RaftService {
 
     /// Start an election by converting to candidate, bumping term, and requesting votes from peers.
     pub async fn start_election(&self) {
-        let rv_args = self.request_vote_args();
+        // 会转变为候选者
+        self.turn_to_candidate();
 
         info!(
             "[Node {}] Starting election for term {} ({} peers)",
-            rv_args.candidate_id,
-            rv_args.term,
+            self.config.node_id,
+            self.core.lock().unwrap().current_term,
             self.peers.len()
         );
 
-        for peer in self
-            .peers
-            .iter()
-            .filter(|p| p.id != self.core.lock().unwrap().id)
-        {
-            let peer = peer.clone();
-            let args = rv_args.clone();
-            let svc = self.clone();
-            let candidate_id = args.candidate_id;
-
-            tokio::spawn(async move {
-                match peer.send_request_vote(args).await {
-                    Ok(reply) => {
-                        svc.on_receive_rv_reply(&reply);
-                    }
-                    Err(err) => {
-                        info!(
-                            "[Node {}] Failed to request vote from peer {}: {}",
-                            candidate_id, peer.id, err
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// 并发地对所有 peers 发送心跳
-    ///
-    /// 内部只会在 Leader 状态下发送心跳
-    /// # Notes
-    /// * RPC - 会调用 AE RPC
-    /// * 状态机 - 可能会与底层状态机交互（因为多数节点可能复制了日志）
-    pub async fn broadcast_heartbeat(&self) {
-        for peer in self
-            .peers
-            .iter()
-            .filter(|p| p.id != self.core.lock().unwrap().id)
-        {
-            if let Some(args) = self.append_entries_args(peer.id) {
-                let peer = peer.clone();
+        // 直接向所有peer发送RequestVote RPC
+        for peer in self.peers.iter() {
+            if peer.id != self.config.node_id {
                 let svc = self.clone();
-
+                let peer_clone = peer.clone();
+                // 应该监听cancel token吗？
                 tokio::spawn(async move {
-                    match peer.send_append_entries(args.clone()).await {
-                        Ok(reply) => {
-                            svc.on_receive_ae_reply(&args, &reply, peer.id);
-                        }
-                        Err(err) => {
-                            info!(
-                                "[Node {}] Failed heartbeat to peer {}: {}",
-                                args.leader_id, peer.id, err
-                            );
-                        }
-                    }
+                    svc.send_request_vote(&peer_clone).await;
                 });
             }
         }
     }
 
-    fn append_entries_args(&self, peer_id: u32) -> Option<AppendEntriesArgs> {
-        let node = self.core.lock().unwrap();
-        node.append_entries_args(peer_id)
+    /// 通知所有Replicator执行任务
+    fn notify_all_replicators(&self) {
+        for (i, peer) in self.peers.iter().enumerate() {
+            if peer.id != self.config.node_id {
+                self.replicator_notifiers[i].notify_one();
+            }
+        }
     }
 
-    fn request_vote_args(&self) -> RequestVoteArgs {
+    fn turn_to_candidate(&self) {
         let mut node = self.core.lock().unwrap();
         node.state = NodeState::Candidate { votes: 0 }; // exclude vote from self
         node.current_term += 1;
         node.voted_for = Some(node.id);
-        node.request_vote_args()
+        node.last_heartbeat = Instant::now();
     }
 
     fn on_receive_ae_reply(
@@ -490,14 +490,13 @@ impl RaftService {
                     next_index: vec![node.log.len() as u32; self.peers.len()],
                     match_index: vec![0; self.peers.len()],
                 };
-                // start heartbeat
-                let svc = self.clone();
-                tokio::spawn(async move {
-                    while matches!(svc.core.lock().unwrap().state, NodeState::Leader { .. }) {
-                        svc.broadcast_heartbeat().await;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                });
+                info!(
+                    "[Node {}] Became leader for term {}",
+                    node_id, node.current_term
+                );
+                drop(node); // 释放锁
+                // 通知所有Replicator开始发送心跳（它们会根据当前状态自动切换到AppendEntries模式）
+                self.notify_all_replicators();
             }
         }
     }
@@ -551,10 +550,10 @@ impl RaftService {
 
     pub fn handle_append_entries(&self, mut args: AppendEntriesArgs) -> AppendEntriesReply {
         let mut node = self.core.lock().unwrap();
-        
+
         // 更新心跳时间
         node.last_heartbeat = Instant::now();
-        
+
         node.on_receive_term(args.term);
 
         info!(
@@ -638,30 +637,83 @@ impl RaftService {
     /// Returns (index, term) if successful, or Err with the last known leader ID.
     pub fn propose_command(&self, command: Command) -> Result<(u32, u32), Option<u32>> {
         let mut node = self.core.lock().unwrap();
-        
+
         // 检查是否是leader
         if !matches!(node.state, NodeState::Leader { .. }) {
             // 不是leader，返回最近已知的leader
             return Err(node.last_known_leader);
         }
-        
+
         let term = node.current_term;
-        
+
         // 创建新的日志条目
         let entry = LogEntry {
             term,
             command: Some(command.into()),
         };
-        
+
         // 将条目追加到日志中
         node.log.push(entry);
         let log_index = node.last_log_index();
-        
+
         info!(
             "[Node {}] Proposed command at index {} for term {}",
             node.id, log_index, term
         );
-        
+
+        drop(node); // 释放锁
+
+        // 通知所有Replicator立即开始复制新日志
+        self.notify_all_replicators();
+
         Ok((log_index, term))
+    }
+
+    /// 发送RequestVote RPC到指定peer
+    async fn send_request_vote(&self, peer: &Arc<Peer>) {
+        let args = {
+            let core = self.core.lock().unwrap();
+            if !matches!(core.state, NodeState::Candidate { .. }) {
+                return;
+            }
+            core.request_vote_args()
+        };
+
+        match peer.send_request_vote(args.clone()).await {
+            Ok(reply) => {
+                self.on_receive_rv_reply(&reply);
+            }
+            Err(err) => {
+                info!(
+                    "[Node {}] Failed to request vote from peer {}: {}",
+                    args.candidate_id, peer.id, err
+                );
+            }
+        }
+    }
+
+    /// 发送AppendEntries RPC到指定peer
+    async fn send_append_entries(&self, peer: &Arc<Peer>) {
+        let args = {
+            let core = self.core.lock().unwrap();
+            if !matches!(core.state, NodeState::Leader { .. }) {
+                return;
+            }
+            core.append_entries_args(peer.id)
+        };
+
+        if let Some(args) = args {
+            match peer.send_append_entries(args.clone()).await {
+                Ok(reply) => {
+                    self.on_receive_ae_reply(&args, &reply, peer.id);
+                }
+                Err(err) => {
+                    info!(
+                        "[Node {}] Failed heartbeat to peer {}: {}",
+                        args.leader_id, peer.id, err
+                    );
+                }
+            }
+        }
     }
 }

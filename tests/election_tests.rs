@@ -45,7 +45,7 @@ async fn test_initial_election_3a() -> Result<(), String> {
 #[instrument]
 async fn test_re_election_3a() -> Result<(), String> {
     let servers = 3;
-    let mut ts = TestHarness::new(servers).await;
+    let ts = TestHarness::new(servers).await;
 
     info!("===== Test (3A): election after network failure =====");
 
@@ -55,7 +55,7 @@ async fn test_re_election_3a() -> Result<(), String> {
     ts.disconnect_all(leader1);
     ts.log_network();
     sleep(2 * RAFT_ELECTION_TIMEOUT).await;
-    let leader2 = ts.check_one_leader().await?;
+    let _ = ts.check_one_leader().await?;
     // If the old leader rejoins, that shouldn't disturb the new leader
     debug!("testing old leader rejoining...");
     ts.connect_one(leader1);
@@ -98,9 +98,9 @@ async fn test_re_election_3a() -> Result<(), String> {
 #[instrument]
 async fn test_many_elections_3a() -> Result<(), String> {
     let servers = 7;
-    let mut ts = TestHarness::new(servers).await;
+    let ts = TestHarness::new(servers).await;
 
-    ts.begin("Test (3A): multiple elections");
+    info!("===== Test (3A): multiple elections =====");
 
     // Give time for initial election
     info!("waiting for initial election...");

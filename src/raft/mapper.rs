@@ -1,3 +1,4 @@
+use crate::raft::Command;
 /// Mapper module for converting between protobuf network transfer objects and domain models
 /// 
 /// This module provides conversions between:
@@ -5,7 +6,35 @@
 /// - Domain model types (without Pb suffix) used internally
 
 use crate::raft::core::{AppendEntriesArgs, AppendEntriesReply, LogEntry, RequestVoteArgs, RequestVoteReply};
-use crate::raft::proto::{AppendEntriesArgsPb, AppendEntriesReplyPb, LogEntryPb, RequestVoteArgsPb, RequestVoteReplyPb};
+use crate::raft::proto::{AppendEntriesArgsPb, AppendEntriesReplyPb, KvCommand, KvGet, KvSet, LogEntryPb, RequestVoteArgsPb, RequestVoteReplyPb, kv_command};
+
+impl From<Command> for KvCommand {
+    fn from(value: Command) -> Self {
+        match value {
+            Command::Get { key } => KvCommand {
+                cmd: Some(kv_command::Cmd::Get(KvGet { key })),
+            },
+            Command::Set { key, value } => KvCommand {
+                cmd: Some(kv_command::Cmd::Set(KvSet { key, value })),
+            },
+        }
+    }
+}
+
+impl TryFrom<KvCommand> for Command {
+    type Error = ();
+
+    fn try_from(value: KvCommand) -> Result<Self, Self::Error> {
+        match value.cmd {
+            Some(kv_command::Cmd::Get(get)) => Ok(Command::Get { key: get.key }),
+            Some(kv_command::Cmd::Set(set)) => Ok(Command::Set {
+                key: set.key,
+                value: set.value,
+            }),
+            None => Err(()),
+        }
+    }
+}
 
 // ============================================================================
 // LogEntry conversions

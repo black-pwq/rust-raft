@@ -401,13 +401,6 @@ impl TestHarness {
         sleep(Duration::from_millis(50)).await;
     }
 
-    pub fn begin(&mut self, description: &str) {
-        info!(
-            "════STARTING SERVERS {}: {}═════",
-            self.n_servers, description
-        );
-    }
-
     pub fn log_network(&self) {
         let mut connected = Vec::new();
         let mut disconnected = Vec::new();

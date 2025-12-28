@@ -113,6 +113,9 @@ impl Network {
         (0..self.n).any(|j| j != node && self.links[node][j].enabled)
     }
 
+    /// 将指定 node 节点与所有其他节点断开连接
+    /// 
+    /// 该行为是双向的。你可以认为调用该函数破坏了该节点的网卡
     pub fn disconnect_all(&mut self, node: usize) {
         if node >= self.n {
             return;
@@ -128,6 +131,9 @@ impl Network {
         }
     }
 
+    /// 将指定 node 节点重新连接到网络
+    /// 
+    /// 该行为是双向的，但只会连接到那些没有 disconnect_all（破坏了网卡） 的节点
     pub fn connect_one(&mut self, node: usize) {
         if node >= self.n {
             return;
