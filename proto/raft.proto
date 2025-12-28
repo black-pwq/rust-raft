@@ -7,15 +7,15 @@ package raft;
 // votes, leaders replicate logs and act as heartbeats.
 service Raft {
 	// Invoked by candidates to gather votes (§5.2).
-	rpc RequestVote (RequestVoteArgs) returns (RequestVoteReply);
+	rpc RequestVote (RequestVoteArgsPb) returns (RequestVoteReplyPb);
 	// Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
-	rpc AppendEntries (AppendEntriesArgs) returns (AppendEntriesReply);
+	rpc AppendEntries (AppendEntriesArgsPb) returns (AppendEntriesReplyPb);
 	// Invoked by clients to submit commands to the cluster.
-	rpc ClientCommand (ClientRequest) returns (ClientReply);
+	// rpc ClientCommand (ClientRequest) returns (ClientReply);
 }
 
-message AppendEntriesArgs {
-	// Leader’s current term; follower updates if lower.
+message AppendEntriesArgsPb {
+	// Leader's current term; follower updates if lower.
 	uint32 term = 1;
 	// So follower can redirect clients to current leader.
 	uint32 leader_id = 2;
@@ -23,17 +23,17 @@ message AppendEntriesArgs {
 	uint32 prev_log_index = 3;
 	uint32 prev_log_term = 4;
 	// Log entries to store (empty when sending heartbeat).
-	repeated LogEntry entries = 5;
+	repeated LogEntryPb entries = 5;
 	// Leader’s commit index so follower can advance commit index.
 	uint32 leader_commit = 6;
 }
-message AppendEntriesReply {
+message AppendEntriesReplyPb {
 	// Current term for leader to update itself.
 	uint32 term = 1;
 	// True if follower contained matching prev_log_index and prev_log_term.
 	bool success = 2;
 }
-message LogEntry {
+message LogEntryPb {
 	// Term when entry was received by leader.
 	uint32 term = 1;
 	// State machine command (KV-specific, structured).
@@ -57,7 +57,7 @@ message KvCommand {
 	}
 }
 
-message RequestVoteArgs {
+message RequestVoteArgsPb {
 	// Candidate’s term.
 	uint32 term = 1;
 	// Candidate requesting vote.
@@ -66,7 +66,7 @@ message RequestVoteArgs {
 	uint32 last_log_index = 3;
 	uint32 last_log_term = 4;
 }
-message RequestVoteReply {
+message RequestVoteReplyPb {
 	// Current term for candidate to update itself.
 	uint32 term = 1;
 	// True means candidate received vote.

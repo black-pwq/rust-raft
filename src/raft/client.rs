@@ -1,7 +1,8 @@
 use std::{sync::{Arc, Mutex}, time::Duration};
 use tokio::time::timeout;
 use tonic::{Request, Status};
-use crate::raft::proto::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply, raft_client::RaftClient};
+use crate::raft::proto::{AppendEntriesArgsPb, AppendEntriesReplyPb, RequestVoteArgsPb, RequestVoteReplyPb, raft_client::RaftClient};
+use crate::raft::core::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
 
 #[derive(Clone)]
 pub struct Peer {
@@ -60,10 +61,11 @@ impl Peer {
         args: RequestVoteArgs,
     ) -> Result<RequestVoteReply, Status> {
         let mut client = self.get_or_connect().await?;
-        match timeout(Duration::from_secs(1), client.request_vote(Request::new(args))).await {
+        let args_pb: RequestVoteArgsPb = args.into();
+        match timeout(Duration::from_secs(1), client.request_vote(Request::new(args_pb))).await {
             Ok(Ok(response)) => {
-                let reply: RequestVoteReply = response.into_inner();
-                Ok(reply)
+                let reply_pb: RequestVoteReplyPb = response.into_inner();
+                Ok(reply_pb.into())
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Status::deadline_exceeded("RequestVote RPC timed out")),
@@ -76,11 +78,12 @@ impl Peer {
         args: AppendEntriesArgs,
     ) -> Result<AppendEntriesReply, Status> {
         let mut client = self.get_or_connect().await?;
+        let args_pb: AppendEntriesArgsPb = args.into();
         
-        match timeout(Duration::from_secs(1), client.append_entries(Request::new(args))).await {
+        match timeout(Duration::from_secs(1), client.append_entries(Request::new(args_pb))).await {
             Ok(Ok(response)) => {
-                let reply: AppendEntriesReply = response.into_inner();
-                Ok(reply)
+                let reply_pb: AppendEntriesReplyPb = response.into_inner();
+                Ok(reply_pb.into())
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Status::deadline_exceeded("AppendEntries RPC timed out")),

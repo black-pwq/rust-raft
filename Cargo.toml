@@ -21,8 +21,9 @@ tracing = "*"
 tracing-subscriber = {version = "*", features = ["fmt", "time"]}
 tracing-appender = "*"
 chrono = "*"
-
-[dev-dependencies]
+time = {version = "*", features = ["formatting", "local-offset", "macros"]}
+ctor = "0.6"
 tokio-stream = { version = "0.1", features = ["net"] }
+
 [build-dependencies]
 tonic-prost-build = "0.14"
