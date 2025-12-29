@@ -1,6 +1,7 @@
 pub mod client;
 pub mod core;
 pub mod mapper;
+pub mod storage;
 use tonic::{Request, Response, Status};
 
 // Include generated proto code
@@ -16,6 +17,7 @@ use proto::{
 // Re-export key types for consumers of the crate.
 pub use client::Peer;
 pub use core::{Command, RaftService, ApplyMsg, AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
+pub use storage::{Storage, FileStorage, PersistentState};
 
 #[tonic::async_trait]
 impl Raft for RaftService {

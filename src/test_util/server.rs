@@ -5,7 +5,7 @@ use std::{
 use tokio::sync::{mpsc};
 use tracing::{error};
 
-use crate::{test_util::check::LogChecker, raft::{ApplyMsg, Peer, RaftService, core::RaftConfig}};
+use crate::{test_util::check::LogChecker, raft::{ApplyMsg, Peer, RaftService, core::RaftConfig, storage::FileStorage}};
 
 
 /// A full Raft server node: RaftService + in-memory state machine + committed log tracking.
@@ -32,7 +32,11 @@ impl RaftServer {
         // let state_machine = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         // let pending_requests = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<Result<(), String>>>::new()));
 
-        let service = Arc::new(RaftService::new(peers, apply_tx, config));
+        // 为每个节点创建单独的持久化文件
+        let storage_path = format!("logs/raft_node_{}.json", config.node_id);
+        let storage = Box::new(FileStorage::new(&storage_path).expect("Failed to create storage"));
+
+        let service = Arc::new(RaftService::new(peers, apply_tx, config, storage));
 
         let server = Self {
             id: config.node_id,

@@ -8,18 +8,19 @@ use tokio::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::raft::client::Peer;
+use crate::raft::storage::{Storage, PersistentState};
 
 /// KV存储命令
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Get { key: String },
     Set { key: String, value: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub term: u32,
     pub command: Option<Command>,
@@ -87,7 +88,7 @@ pub struct RaftService {
 }
 
 /// Core Raft state based on Figure 2
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RaftCore {
     // Persistent state on all servers (should be persisted before responding to RPCs)
     /// Latest term server has seen (initialized to 0, increases monotonically)
@@ -112,6 +113,8 @@ pub struct RaftCore {
     pub last_known_leader: Option<u32>,
     /// 最后一次收到心跳的时间
     pub last_heartbeat: Instant,
+    /// 持久化存储
+    storage: Box<dyn Storage>,
 }
 
 /// Raft node states from Figure 2
@@ -147,20 +150,51 @@ pub struct RaftConfig {
 }
 
 impl RaftCore {
-    pub fn new(id: u32) -> Self {
+    /// 创建新的RaftCore，如果storage中有持久化数据则恢复
+    pub fn new(id: u32, storage: Box<dyn Storage>) -> Self {
+        // 尝试从存储中恢复状态
+        let (current_term, voted_for, log) = match storage.restore() {
+            Ok(Some(state)) => {
+                info!(
+                    "[Node {}] Restored persistent state: term={}, voted_for={:?}, log_len={}",
+                    id, state.current_term, state.voted_for, state.log.len()
+                );
+                (state.current_term, state.voted_for, state.log)
+            }
+            Ok(None) => {
+                info!("[Node {}] No persistent state found, starting fresh", id);
+                (0, None, vec![LogEntry { term: 0, command: None }])
+            }
+            Err(e) => {
+                warn!("[Node {}] Failed to restore persistent state: {}, starting fresh", id, e);
+                (0, None, vec![LogEntry { term: 0, command: None }])
+            }
+        };
+
         Self {
-            current_term: 0,
-            voted_for: None,
-            log: vec![LogEntry {
-                term: 0,
-                command: None,
-            }],
+            current_term,
+            voted_for,
+            log,
             commit_index: 0,
             last_applied: 0,
             state: NodeState::Follower,
             id,
             last_known_leader: None,
             last_heartbeat: Instant::now(),
+            storage,
+        }
+    }
+
+    /// 持久化当前的持久化状态（term, voted_for, log）
+    fn persist(&mut self) {
+        let state = PersistentState {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+            log: self.log.clone(),
+        };
+        
+        if let Err(e) = self.storage.persist(&state) {
+            error!("[Node {}] Failed to persist state: {}", self.id, e);
         }
     }
 
@@ -181,35 +215,35 @@ impl RaftCore {
     /// # Notes
     /// 不会改变节点状态
     fn append_entries_args(&self, peer_id: u32) -> Option<AppendEntriesArgs> {
-        if let NodeState::Leader {
-            next_index,
-            match_index: _,
-        } = &self.state
-        {
-            let next_index = next_index[peer_id as usize];
-            let prev_log_index = next_index - 1;
-            let prev_log_term = self.log[prev_log_index as usize].term;
-            let entries = self.log[next_index as usize..].to_vec();
-            let args = AppendEntriesArgs {
-                term: self.current_term,
-                leader_id: self.id,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit: self.commit_index,
-            };
-            Some(args)
-        } else {
-            None
+        match &self.state {
+            NodeState::Leader { next_index, .. } => {
+                let next_index = next_index[peer_id as usize];
+                let prev_log_index = next_index - 1;
+                let prev_log_term = self.log[prev_log_index as usize].term;
+                let entries = self.log[next_index as usize..].to_vec();
+                let args = AppendEntriesArgs {
+                    term: self.current_term,
+                    leader_id: self.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: self.commit_index,
+                };
+                Some(args)
+            }
+            _ => None,
         }
     }
 
-    fn request_vote_args(&self) -> RequestVoteArgs {
-        RequestVoteArgs {
-            term: self.current_term,
-            candidate_id: self.id,
-            last_log_index: self.last_log_index(),
-            last_log_term: self.last_log_term(),
+    fn request_vote_args(&self) -> Option<RequestVoteArgs> {
+        match &self.state {
+            NodeState::Candidate { .. } => Some(RequestVoteArgs {
+                term: self.current_term,
+                candidate_id: self.id,
+                last_log_index: self.last_log_index(),
+                last_log_term: self.last_log_term(),
+            }),
+            _ => None,
         }
     }
 
@@ -223,6 +257,8 @@ impl RaftCore {
             self.current_term = term;
             self.state = NodeState::Follower;
             self.voted_for = None;
+            // 持久化状态变更
+            self.persist();
         }
     }
 
@@ -263,6 +299,7 @@ impl RaftService {
         peers: &Arc<Vec<Arc<Peer>>>,
         apply_tx: mpsc::UnboundedSender<ApplyMsg>,
         config: &Arc<RaftConfig>,
+        storage: Box<dyn Storage>,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
@@ -272,7 +309,7 @@ impl RaftService {
 
         // Initialize RaftCore
         let service = Self {
-            core: Arc::new(Mutex::new(RaftCore::new(config.node_id))),
+            core: Arc::new(Mutex::new(RaftCore::new(config.node_id, storage))),
             apply_tx,
             peers: peers.clone(),
             config: config.clone(),
@@ -286,7 +323,6 @@ impl RaftService {
                 // 跳过自己
                 continue;
             }
-
 
             let svc = service.clone();
             let peer_clone = peer.clone();
@@ -367,7 +403,7 @@ impl RaftService {
     /// 优雅地关闭所有Replicator任务
     pub async fn shutdown(&self) {
         info!(
-            "[Node {}] Shutting down all replicators",
+            "[Node {}] Shutting down all replicators and election timer",
             self.config.node_id
         );
         self.shutdown_token.cancel();
@@ -422,6 +458,8 @@ impl RaftService {
         node.current_term += 1;
         node.voted_for = Some(node.id);
         node.last_heartbeat = Instant::now();
+        // 持久化状态变更
+        node.persist();
     }
 
     fn on_receive_ae_reply(
@@ -539,6 +577,8 @@ impl RaftService {
                 node.id, args.candidate_id
             );
             node.voted_for = Some(args.candidate_id);
+            // 持久化状态变更
+            node.persist();
         } else {
             info!(
                 "[Node {}] Denying vote to candidate {} (can_vote={}, log_up_to_date={})",
@@ -550,9 +590,6 @@ impl RaftService {
 
     pub fn handle_append_entries(&self, mut args: AppendEntriesArgs) -> AppendEntriesReply {
         let mut node = self.core.lock().unwrap();
-
-        // 更新心跳时间
-        node.last_heartbeat = Instant::now();
 
         node.on_receive_term(args.term);
 
@@ -591,7 +628,7 @@ impl RaftService {
         let prev_log_term = node.log[args.prev_log_index as usize].term;
         if prev_log_term != args.prev_log_term {
             info!(
-                "[Node {}] Rejecting AppendEntries: term mismatch at index {} (expected {}, got {})",
+                "[Node {}] Rejecting AppendEntries: prev_log_term mismatch at index {} (expected {}, got {})",
                 node.id, args.prev_log_index, args.prev_log_term, prev_log_term
             );
             return AppendEntriesReply { term, success };
@@ -618,6 +655,8 @@ impl RaftService {
                 node.log.truncate(start_index + *idx);
                 // 追加仍没有的部分 NOTE: SIDE AFFECT
                 node.log.extend(args.entries.drain(*idx..));
+                // 持久化
+                node.persist();
             });
 
         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -661,6 +700,9 @@ impl RaftService {
             node.id, log_index, term
         );
 
+        // 持久化日志变更
+        node.persist();
+
         drop(node); // 释放锁
 
         // 通知所有Replicator立即开始复制新日志
@@ -671,38 +713,24 @@ impl RaftService {
 
     /// 发送RequestVote RPC到指定peer
     async fn send_request_vote(&self, peer: &Arc<Peer>) {
-        let args = {
-            let core = self.core.lock().unwrap();
-            if !matches!(core.state, NodeState::Candidate { .. }) {
-                return;
-            }
-            core.request_vote_args()
-        };
-
-        match peer.send_request_vote(args.clone()).await {
-            Ok(reply) => {
-                self.on_receive_rv_reply(&reply);
-            }
-            Err(err) => {
-                info!(
-                    "[Node {}] Failed to request vote from peer {}: {}",
-                    args.candidate_id, peer.id, err
-                );
+        if let Some(args) = self.request_vote_args() {
+            match peer.send_request_vote(args.clone()).await {
+                Ok(reply) => {
+                    self.on_receive_rv_reply(&reply);
+                }
+                Err(err) => {
+                    info!(
+                        "[Node {}] Failed to request vote from peer {}: {}",
+                        args.candidate_id, peer.id, err
+                    );
+                }
             }
         }
     }
 
     /// 发送AppendEntries RPC到指定peer
     async fn send_append_entries(&self, peer: &Arc<Peer>) {
-        let args = {
-            let core = self.core.lock().unwrap();
-            if !matches!(core.state, NodeState::Leader { .. }) {
-                return;
-            }
-            core.append_entries_args(peer.id)
-        };
-
-        if let Some(args) = args {
+        if let Some(args) = self.append_entries_args(peer.id) {
             match peer.send_append_entries(args.clone()).await {
                 Ok(reply) => {
                     self.on_receive_ae_reply(&args, &reply, peer.id);
@@ -715,5 +743,15 @@ impl RaftService {
                 }
             }
         }
+    }
+
+    fn append_entries_args(&self, peer_id: u32) -> Option<AppendEntriesArgs> {
+        let core = self.core.lock().unwrap();
+        core.append_entries_args(peer_id)
+    }
+
+    fn request_vote_args(&self) -> Option<RequestVoteArgs> {
+        let core = self.core.lock().unwrap();
+        core.request_vote_args()
     }
 }
