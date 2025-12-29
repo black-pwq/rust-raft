@@ -38,12 +38,26 @@ pub struct TestHarness {
     pub server_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Peer endpoints (http://ip:port) indexed by server id
     pub peer_endpoints: Vec<String>,
+    /// Unique test ID to avoid file conflicts in parallel tests
+    test_id: String,
 }
 
 impl TestHarness {
     /// Create a new test harness with `n_servers`.
     pub async fn new(n_servers: usize) -> Self {
-        info!("Creating test harness with {} servers", n_servers);
+        // 生成唯一的测试ID以避免并行测试的文件冲突
+        let test_id = format!("{}_{}", std::process::id(), rand::random::<u64>());
+        info!("Creating test harness with {} servers (test_id: {})", n_servers, test_id);
+
+        // 在开始前清理可能存在的持久化文件
+        for i in 0..n_servers {
+            let storage_path = format!("logs/raft_test_{}_{}.json", test_id, i);
+            if let Err(e) = std::fs::remove_file(&storage_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to remove old storage file {}: {}", storage_path, e);
+                }
+            }
+        }
 
         // Bind listeners on ephemeral ports first so tests can run in parallel.
         let mut listeners = Vec::with_capacity(n_servers);
@@ -93,7 +107,8 @@ impl TestHarness {
                 heartbeat_interval_ms: 100,
             });
 
-            let server = Arc::new(RaftServer::new(&all_peers, &config, checker.clone()));
+            let storage_path = format!("logs/raft_test_{}_{}.json", test_id, i);
+            let server = Arc::new(RaftServer::new(&all_peers, &config, checker.clone(), &storage_path));
             servers.push(server.clone());
 
             let filtered_service = NetworkFilteredService::new(server.clone(), i, network.clone());
@@ -119,6 +134,7 @@ impl TestHarness {
             network,
             server_handles,
             peer_endpoints,
+            test_id,
         }
     }
 
@@ -395,10 +411,25 @@ impl TestHarness {
     }
 
     pub async fn cleanup(self) {
+        for srv in self.servers {
+            srv.shutdown().await;
+        }
         for handle in self.server_handles {
             handle.abort();
         }
         sleep(Duration::from_millis(50)).await;
+
+        // 清理持久化文件
+        for i in 0..self.n_servers {
+            let storage_path = format!("logs/raft_test_{}_{}.json", self.test_id, i);
+            if let Err(e) = std::fs::remove_file(&storage_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to remove storage file {}: {}", storage_path, e);
+                }
+            } else {
+                info!("Removed storage file: {}", storage_path);
+            }
+        }
     }
 
     pub fn log_network(&self) {

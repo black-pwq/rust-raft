@@ -3,7 +3,8 @@ use std::{
 };
 
 use tokio::sync::{mpsc};
-use tracing::{error};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use crate::{test_util::check::LogChecker, raft::{ApplyMsg, Peer, RaftService, core::RaftConfig, storage::FileStorage}};
 
@@ -19,6 +20,7 @@ pub struct RaftServer {
     pub service: Arc<RaftService>,
     pub checker: Arc<LogChecker>,
     apply_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<ApplyMsg>>>,
+    applier_cancel_token: CancellationToken,
     // pub state_machine: Arc<Mutex<HashMap<String, String>>>,
     // pending_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>,
 }
@@ -27,22 +29,24 @@ impl RaftServer {
     /// Create a Raft server node.
     ///
     /// RaftService owns the Raft protocol logic; RaftServer owns state machine application.
-    pub fn new(peers: &Arc<Vec<Arc<Peer>>>, config: &Arc<RaftConfig>, checker: Arc<LogChecker>) -> Self {
+    pub fn new(peers: &Arc<Vec<Arc<Peer>>>, config: &Arc<RaftConfig>, checker: Arc<LogChecker>, storage_path: &str) -> Self {
         let (apply_tx, apply_rx) = mpsc::unbounded_channel::<ApplyMsg>();
         // let state_machine = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         // let pending_requests = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<Result<(), String>>>::new()));
 
-        // 为每个节点创建单独的持久化文件
-        let storage_path = format!("logs/raft_node_{}.json", config.node_id);
-        let storage = Box::new(FileStorage::new(&storage_path).expect("Failed to create storage"));
+        // 创建持久化存储
+        let storage = Box::new(FileStorage::new(storage_path).expect("Failed to create storage"));
 
         let service = Arc::new(RaftService::new(peers, apply_tx, config, storage));
+
+        let applier_cancel_token = CancellationToken::new();
 
         let server = Self {
             id: config.node_id,
             service,
             checker,
             apply_rx: Arc::new(tokio::sync::Mutex::new(apply_rx)),
+            applier_cancel_token,
             // state_machine,
             // pending_requests,
         };
@@ -55,16 +59,39 @@ impl RaftServer {
         let id = self.id;
         let apply_rx = self.apply_rx.clone();
         let checker = self.checker.clone();
+        let cancel_token = self.applier_cancel_token.clone();
 
         tokio::spawn(async move {
             let mut rx = apply_rx.lock().await;
-            while let Some(msg) = rx.recv().await {
-                if let Err(s) =  checker.append_log(id as usize, msg).await {
-                    error!("{s}");
-                    panic!("{s}")
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        info!("[Node {}] Applier task cancelled", id);
+                        break;
+                    }
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                if let Err(s) = checker.append_log(id as usize, msg).await {
+                                    error!("{s}");
+                                    panic!("{s}")
+                                }
+                            }
+                            None => {
+                                info!("[Node {}] Apply channel closed", id);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
+    }
+
+    pub async fn shutdown(&self) {
+        info!("[Node {}] Shutting down server", self.id);
+        self.applier_cancel_token.cancel();
+        self.service.shutdown().await;
     }
 
     // fn register_pending_request(&self, log_index: u32) -> oneshot::Receiver<Result<(), String>> {
